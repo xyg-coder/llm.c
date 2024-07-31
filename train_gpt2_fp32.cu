@@ -19,6 +19,9 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 #include <float.h>
 #include <string.h>
 #include <unistd.h>
+#include <thread>
+#include <chrono>
+#include <iostream>
 
 // GPU / CUDA related
 #include <cublas_v2.h>
@@ -1557,10 +1560,33 @@ void error_usage() {
     exit(EXIT_FAILURE);
 }
 
+void dataloader_init_thread(
+    DataLoader *p_train_dataloader, DataLoader *p_val_dataloader,
+    const char* train_data_pattern, const char* val_data_pattern, int B, int T,
+    int* train_num_batches, int* val_num_batches, int val_max_steps) {
+    dataloader_init(p_train_dataloader, train_data_pattern, B, T, 0, 1, 1);
+    dataloader_init(p_val_dataloader, val_data_pattern, B, T, 0, 1, 0);
+
+        // build DataLoaders for both train and val
+    *train_num_batches = p_train_dataloader->num_tokens / (B*T); // let's do 1 epoch by default for now
+    *val_num_batches = p_val_dataloader->num_tokens / (B*T);
+    if (*val_num_batches > val_max_steps) { *val_num_batches = val_max_steps; }
+}
+
+void logger_init_thread(
+    Logger* p_logger, const char *filename) {
+    logger_init(p_logger, filename);
+}
+
+void tokenizer_init_thread(Tokenizer* p_tokenizer, const char* filename) {
+    tokenizer_init(p_tokenizer, filename);
+}
+
 // ----------------------------------------------------------------------------
 // main training loop
 int main(int argc, char *argv[]) {
 
+    auto start_t = std::chrono::high_resolution_clock::now();
     // read in the (optional) command line arguments
     const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
     const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
@@ -1604,6 +1630,22 @@ int main(int argc, char *argv[]) {
     printf("| genT                  | %-50d |\n", genT);
     printf("+-----------------------+----------------------------------------------------+\n");
 
+    // build DataLoaders for both train and val
+    DataLoader train_loader, val_loader;
+    int train_num_batches, val_num_batches;
+    std::thread t_dataloader_init(
+        dataloader_init_thread,
+        &train_loader, &val_loader, train_data_pattern, val_data_pattern, B, T, &train_num_batches, &val_num_batches, val_max_steps);
+
+
+    // set up the Logger
+    Logger logger;
+    std::thread t_logger_init(logger_init_thread, &logger, output_log_file);
+
+    // build the Tokenizer
+    Tokenizer tokenizer;
+    std::thread t_tokenizer_init(tokenizer_init_thread, &tokenizer, "gpt2_tokenizer.bin");
+
     // set up the device
     int deviceIdx = 0;
     cudaCheck(cudaSetDevice(deviceIdx));
@@ -1632,13 +1674,7 @@ int main(int argc, char *argv[]) {
     printf("| num_parameters        | %-50zu |\n", model.num_parameters);
     printf("+-----------------------+----------------------------------------------------+\n");
 
-    // build DataLoaders for both train and val
-    DataLoader train_loader, val_loader;
-    dataloader_init(&train_loader, train_data_pattern, B, T, 0, 1, 1);
-    dataloader_init(&val_loader, val_data_pattern, B, T, 0, 1, 0);
-    int train_num_batches = train_loader.num_tokens / (B*T); // let's do 1 epoch by default for now
-    int val_num_batches = val_loader.num_tokens / (B*T);
-    if (val_num_batches > val_max_steps) { val_num_batches = val_max_steps; }
+    t_dataloader_init.join();
     printf("| train_num_batches     | %-50d |\n", train_num_batches);
     printf("| val_num_batches       | %-50d |\n", val_num_batches);
     printf("+-----------------------+----------------------------------------------------+\n");
@@ -1646,13 +1682,12 @@ int main(int argc, char *argv[]) {
     // print model parameter allocations from gpt2_build_from_checkpoint down here to not mess up our table above
     printf("allocated %d MiB for model parameters\n", (int)round(model.num_parameters * sizeof(float) / (1024 * 1024)));
 
-    // set up the Logger
-    Logger logger;
-    logger_init(&logger, output_log_file);
+    t_logger_init.join();
+    t_tokenizer_init.join();
+    auto stop_t = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(stop_t - start_t);
+    std::cout << "timer == " << duration.count() << std::endl;
 
-    // build the Tokenizer
-    Tokenizer tokenizer;
-    tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
 
     // some memory for generating samples from the model
     unsigned long long rng_state = 1337;
