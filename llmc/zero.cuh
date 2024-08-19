@@ -74,6 +74,7 @@ typedef struct {
     ncclComm_t nccl_comm;       // NCCL communication primitive, used for collective multi-GPU work.
     cudaStream_t nccl_stream;   // CUDA Stream to perform NCCL operations.
     cudaEvent_t compute_nccl_sync; // Event used to synchronize NCCL with the compute
+    cudaEvent_t* broadcast_nccl_syncs; // Event used to synchronize NCCL with the compute
     float* unified_buffer;
 #endif
 } MultiGpuConfig;
@@ -106,6 +107,50 @@ void send_nccl_id_to_clients(ncclUniqueId *nccl_id, int client_sockets[], int nu
     }
 }
 #endif
+
+template<int N>
+void get_parameter_from_sharding(
+    MultiGpuConfig* config,
+    floatX* const (&tensor)[N],
+    const size_t (&pointers_size)[N],
+    int source_index,
+    cudaStream_t compute_stream, int broad_cast_events_index) {
+
+
+#ifdef MULTI_GPU
+    NVTX_RANGE_FN();
+    ncclCheck(ncclGroupStart());
+    for (int i = 0; i < N; ++i) {
+        if (config->process_rank != source_index) {
+            cudaCheck(cudaMallocAsync(&(tensor[i]), pointers_size[i], config->nccl_stream));
+        }
+        ncclCheck(ncclBroadcast(tensor[i], tensor[i], pointers_size[i], ncclFloatX, source_index, config->nccl_comm, config->nccl_stream));
+    }
+    ncclCheck(ncclGroupEnd());
+
+    cudaCheck(cudaEventRecord(config->broadcast_nccl_sync[broad_cast_events_index], config->nccl_stream));
+#endif
+}
+
+template<int N>
+void free_parameters_sharding(
+    MultiGpuConfig* config,
+    floatX* const (&tensor)[N],
+    int source_index,
+    int source_index, cudaStream_t compute_stream) {
+
+
+#ifdef MULTI_GPU
+    NVTX_RANGE_FN();
+    cudaCheck(cudaEventRecord(config->broadcast_nccl_sync, compute_stream));
+    cudaCheck(cudaStreamWaitEvent(config->nccl_stream, config->broadcast_nccl_sync));
+    for (int i = 0; i < N; ++i) {
+        if (config->process_rank != source_index) {
+            cudaCheck(cudaFreeAsync(tensor[i], config->nccl_stream));
+        }
+    }
+#endif
+}
 
 #ifdef _WIN32
 // Same as get_nccl_id_via_tcp but for Windows
@@ -450,8 +495,10 @@ MultiGpuConfig multi_gpu_config_init(int num_processes, int process_rank, int gp
     cudaCheck(cudaStreamCreate(&result.nccl_stream));
     // event without timing for maximum performance
     cudaCheck(cudaEventCreate(&result.compute_nccl_sync, cudaEventDisableTiming));
+    cudaCheck(cudaEventCreate(&result.broadcast_nccl_sync, cudaEventDisableTiming));
     nvtxNameCudaStreamA(result.nccl_stream, "nccl stream");
     nvtxNameCudaEventA(result.compute_nccl_sync, "nccl compute sync");
+    nvtxNameCudaEventA(result.broadcast_nccl_sync, "nccl compute sync");
     cudaCheck(cudaMallocManaged(&result.unified_buffer, sizeof(float)));
     return result;
 #else
@@ -470,6 +517,7 @@ void multi_gpu_config_free(MultiGpuConfig* config) {
     ncclCheck(ncclCommDestroy(config->nccl_comm));
     cudaCheck(cudaStreamDestroy(config->nccl_stream));
     cudaCheck(cudaEventDestroy(config->compute_nccl_sync));
+    cudaCheck(cudaEventDestroy(config->broadcast_nccl_sync));
     cudaCheck(cudaFree(config->unified_buffer));
     #ifdef USE_MPI
     mpiCheck(MPI_Finalize());
