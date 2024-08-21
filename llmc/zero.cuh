@@ -111,8 +111,8 @@ void send_nccl_id_to_clients(ncclUniqueId *nccl_id, int client_sockets[], int nu
 template<int N>
 void get_parameter_from_sharding(
     MultiGpuConfig* config,
-    floatX* const (&tensor)[N],
-    const size_t (&pointers_size)[N],
+    floatX *pointer,
+    const size_t total_size,
     int source_index,
     cudaStream_t compute_stream, int broad_cast_events_index) {
 
@@ -120,14 +120,12 @@ void get_parameter_from_sharding(
 #ifdef MULTI_GPU
     NVTX_RANGE_FN();
     ncclCheck(ncclGroupStart());
-    for (int i = 0; i < N; ++i) {
-        if (config->process_rank != source_index) {
-            cudaCheck(cudaMallocAsync(&(tensor[i]), pointers_size[i], config->nccl_stream));
-        }
-        ncclCheck(ncclBroadcast(tensor[i], tensor[i], pointers_size[i], ncclFloatX, source_index, config->nccl_comm, config->nccl_stream));
+    cudaCheck(cudaMallocAsync(&pointer, total_size, config->nccl_stream));
+    if (config->process_rank != source_index) {
+        ncclCheck(ncclBroadcast(pointer, pointer, total_size, ncclFloatX, source_index, config->nccl_comm, config->nccl_stream));
     }
-    ncclCheck(ncclGroupEnd());
 
+    ncclCheck(ncclGroupEnd());
     cudaCheck(cudaEventRecord(config->broadcast_nccl_sync[broad_cast_events_index], config->nccl_stream));
 #endif
 }
@@ -135,19 +133,17 @@ void get_parameter_from_sharding(
 template<int N>
 void free_parameters_sharding(
     MultiGpuConfig* config,
-    floatX* const (&tensor)[N],
+    floatX *pointer,
     int source_index,
-    int source_index, cudaStream_t compute_stream) {
+    int broad_cast_events_index, cudaStream_t compute_stream) {
 
 
 #ifdef MULTI_GPU
     NVTX_RANGE_FN();
-    cudaCheck(cudaEventRecord(config->broadcast_nccl_sync, compute_stream));
+    cudaCheck(cudaEventRecord(config->broadcast_nccl_sync[broad_cast_events_index], compute_stream));
     cudaCheck(cudaStreamWaitEvent(config->nccl_stream, config->broadcast_nccl_sync));
-    for (int i = 0; i < N; ++i) {
-        if (config->process_rank != source_index) {
-            cudaCheck(cudaFreeAsync(tensor[i], config->nccl_stream));
-        }
+    if (config->process_rank != source_index) {
+        cudaCheck(cudaFreeAsync(pointer, config->nccl_stream));
     }
 #endif
 }

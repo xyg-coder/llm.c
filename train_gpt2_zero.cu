@@ -101,8 +101,8 @@ typedef struct {
     floatX* wte; // (V, C)
     floatX* wpe; // (maxT, C)
     // trying to split into n_gpus parts
-    floatX** ln1w; // (L, C)
-    floatX** ln1b; // (L, C)
+    floatX* ln1w; // (L, C)
+    floatX* ln1b; // (L, C)
     floatX** qkvw; // (L, 3*C, C)
     floatX** qkvb; // (L, 3*C)
     floatX** attprojw; // (L, C, C)
@@ -128,8 +128,8 @@ void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, int n_gp
     assert(L % n_gpus == 0);
     param_sizes[0] = Vp * C; // wte
     param_sizes[1] = maxT * C; // wpe
-    param_sizes[2] = L / n_gpus * C; // ln1w
-    param_sizes[3] = L / n_gpus * C; // ln1b
+    param_sizes[2] = L * C; // ln1w
+    param_sizes[3] = L * C; // ln1b
     param_sizes[4] = L / n_gpus * (3 * C) * C; // qkvw
     param_sizes[5] = L / n_gpus * (3 * C); // qkvb
     param_sizes[6] = L / n_gpus * C * C; // attprojw
@@ -161,7 +161,7 @@ void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elemen
     cudaCheck(cudaMalloc((void**)&params_memory, num_parameters_bytes));
     // assign all the tensors their place in the array
     floatX** ptrs[] = {
-        &params->wte, &params->wpe, &params->ln1w[rank_id], &params->ln1b[rank_id], &params->qkvw[rank_id], &params->qkvb[rank_id],
+        &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw[rank_id], &params->qkvb[rank_id],
         &params->attprojw[rank_id], &params->attprojb[rank_id], &params->ln2w[rank_id], &params->ln2b[rank_id], &params->fcw[rank_id], &params->fcb[rank_id],
         &params->fcprojw[rank_id], &params->fcprojb[rank_id], &params->lnfw, &params->lnfb
     };
@@ -779,6 +779,40 @@ float gpt2_validate(GPT2 *model, const int* inputs, const int* targets, size_t B
     mean_loss /= B*T;
     cudaCheck(cudaDeviceSynchronize());
     return mean_loss;
+}
+
+constexpr const int pre_fetch_layers = 2;
+
+void broadcast_if_necessary(GPT2 *model, int total_layer, int current_layer, MultiGpuConfig* gpu_config, bool include_grads) {
+    int each_gpu_layers = total_layer / gpu_config->num_processes;
+    assert(each_gpu_layers > pre_fetch_layers);
+    if (current_layer == 0 || (current_layer + pre_fetch_layers) % each_gpu_layers == 0) {
+        int index = current_layer == 0 ? 0 : (current_layer + pre_fetch_layers) / each_gpu_layers;
+        // TODO: we put each layer together, so we can try to broadcast them altogether
+        floatX* const pointers[] = {
+            model->params.qkvw[index],
+            model->params.qkvb[index],
+            model->params.attprojw[index],
+            model->params.attprojb[index],
+            model->params.ln2w[index],
+            model->params.ln2b[index],
+            model->params.fcw[index],
+            model->params.fcb[index],
+            model->params.fcprojw[index],
+            model->params.fcprojb[index]
+        };
+    }
+
+    if (current_layer == 0 || current_layer % each_gpu_layers == 0) {
+        // compute layers wait for the broadcasts
+    }
+}
+
+void release_layers(GPT2 *model, int total_layer, int current_layer, MultiGpuConfig* gpu_config, bool include_grads) {
+    int each_gpu_layers = total_layer / gpu_config->num_processes;
+    if (current_layer > 0 && current_layer % each_gpu_layers == 0) {
+        // async release
+    }
 }
 
 void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int grad_accum_steps, int micro_step) {
