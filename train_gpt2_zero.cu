@@ -150,7 +150,7 @@ void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, int n_gp
 }
 
 // allocate memory for the parameters and point the individual tensors to the right places
-void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elements, size_t *param_sizeof) {
+void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elements, size_t *param_sizeof, int rank_id) {
     // calculate the total number of parameters and bytes across all tensors
     size_t num_parameters_bytes = 0;
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
@@ -161,9 +161,9 @@ void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elemen
     cudaCheck(cudaMalloc((void**)&params_memory, num_parameters_bytes));
     // assign all the tensors their place in the array
     floatX** ptrs[] = {
-        &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
-        &params->attprojw, &params->attprojb, &params->ln2w, &params->ln2b, &params->fcw, &params->fcb,
-        &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb
+        &params->wte, &params->wpe, &params->ln1w[rank_id], &params->ln1b[rank_id], &params->qkvw[rank_id], &params->qkvb[rank_id],
+        &params->attprojw[rank_id], &params->attprojb[rank_id], &params->ln2w[rank_id], &params->ln2b[rank_id], &params->fcw[rank_id], &params->fcb[rank_id],
+        &params->fcprojw[rank_id], &params->fcprojb[rank_id], &params->lnfw, &params->lnfb
     };
     char* params_memory_iterator = (char*)params_memory;
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
@@ -356,9 +356,9 @@ void gpt2_init_common(GPT2 *model) {
     model->gelu_fusion = 0; //deviceProp.major >= 9 ? 2 : 0; // default: off for now (default must match main())
 }
 
-void gpt2_allocate_weights(GPT2 *model) {
+void gpt2_allocate_weights(GPT2 *model, int n_processes, int rank_id) {
     // fill in all the parameter tensor dimensions and types
-    fill_in_parameter_sizes(model->param_elements, model->param_sizeof, model->config);
+    fill_in_parameter_sizes(model->param_elements, model->param_sizeof, n_processes, model->config);
     model->num_parameters = 0;
     model->num_parameters_bytes = 0;
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
@@ -367,13 +367,13 @@ void gpt2_allocate_weights(GPT2 *model) {
     }
     // create memory for model parameters on the device
     assert(model->params_memory == nullptr);
-    model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof);
+    model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof, rank_id);
 }
 
-void gpt2_allocate_state(GPT2 *model, int B, int T) {
+void gpt2_allocate_state(GPT2 *model, int B, int T, int rank_id) {
     printf0("allocating %d MiB for parameter gradients\n", (int)round(model->num_parameters * sizeof(floatX) / (1024 * 1024)));
     assert(model->grads_memory == nullptr);
-    model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_elements, model->param_sizeof);
+    model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_elements, model->param_sizeof, rank_id);
 
     // record the current B,T as well
     model->batch_size = B;
@@ -445,7 +445,7 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
     fcloseCheck(model_file);
 }
 
-void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool weight_init=true) {
+void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, int n_processes, int rank_id, bool weight_init=true) {
     // If weight_init is true, we will load the weights from this checkpoint .bin file
     // We sometimes want this to be false, if we are going to initialize these weights from
     // the master weights that are instead stored in the state .bin file.
@@ -497,11 +497,12 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
     model->config.padded_vocab_size = model_header[7];
 
     // allocate memory for the model parameters
-    gpt2_allocate_weights(model);
+    gpt2_allocate_weights(model, n_processes, rank_id);
 
     // read in the parameters if weight_init is true
     if (weight_init) {
         assert(model->params_memory != NULL);
+        // different gpus need to read different files
         file_to_device(model->params_memory, model_file, model->num_parameters_bytes, IO_BUF_SIZE, main_stream);
     }
     fcloseCheck(model_file);
@@ -553,7 +554,7 @@ void gpt3_set_hyperparameters(GPT2Config* config, const char* channels_str) {
     config->max_seq_len = 2048; // NOTE: GPT-3 uses context length of 2048 tokens, up from 1024 in GPT-2
 }
 
-void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
+void gpt_build_from_descriptor(GPT2 *model, const char* descriptor, int n_processes) {
     // The model descriptor can be:
     // - legacy format "dX", where X is number, e.g. "d12". This creates GPT-2 model with 12 layers.
     // - new explicit format "gpt2:dX", same as above, e.g. "gpt2:d48" for GPT-2 with 48 layers.
@@ -576,7 +577,7 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
     model->config.vocab_size = 50257;
     model->config.padded_vocab_size = 50304; // padded to 128 for CUDA kernel efficiency
 
-    gpt2_allocate_weights(model);
+    gpt2_allocate_weights(model, n_processes);
 
     // allocate and random init the memory for all the parameters with GPT-2 schema
     // weights ~N(0, 0.02), biases 0, c_proj weights ~N(0, 0.02/(2*L)**0.5)
@@ -1570,10 +1571,10 @@ int main(int argc, char *argv[]) {
         // if `-y 1` was set, then we are resuming from the latest checkpoint
         // if we are using master weights, we'll init them later inside load_state()
         bool weight_init = !use_master_weights;
-        gpt2_build_from_checkpoint(&model, filename_buffer, weight_init);
+        gpt2_build_from_checkpoint(&model, filename_buffer, num_processes, multi_gpu_config.process_rank, weight_init);
     } else if (ends_with_bin(load_filename)) {
         // otherwise, if this is a .bin file, we assume it's a model, let's init from it
-        gpt2_build_from_checkpoint(&model, load_filename);
+        gpt2_build_from_checkpoint(&model, load_filename, num_processes, multi_gpu_config.process_rank);
     } else {
         // if it's not .bin, it could be a "special descriptor". This descriptor is used to
         // construct GPT-2 / GPT-3 models in a convenient format. See the function for docs.
@@ -1669,7 +1670,7 @@ int main(int argc, char *argv[]) {
 
     // if we found a checkpoint to resume from, load the optimization state
     int step = 0;
-    gpt2_allocate_state(&model, B, T);
+    gpt2_allocate_state(&model, B, T, multi_gpu_config.process_rank);
     if (resuming == 1) {
         snprintf(filename_buffer, sizeof(filename_buffer), "%s/state_%08d_%05d.bin", output_log_dir, resume_max_step, multi_gpu_config.process_rank);
         load_state(&step, &model, &train_loader, filename_buffer);
